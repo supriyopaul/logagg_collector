@@ -15,18 +15,15 @@ from hashlib import md5
 import shutil
 import tempfile
 
+import requests
 import ujson as json
 from diskdict import DiskDict
 from deeputil import AttrDict
 from deeputil import keeprunning
 from pygtail import Pygtail
-import tornado.ioloop
-import tornado.web
-from kwikapi.tornado import RequestHandler
-from kwikapi import API
-
 from logagg_utils import utils
-from .nsqsender import NSQSender
+from logagg_utils import NSQSender
+
 from .formatters import RawLog
 
 def load_formatter_fn(formatter):
@@ -42,6 +39,11 @@ def load_formatter_fn(formatter):
 
 class LogCollector():
     DESC = 'Collects the log information and sends to NSQTopic'
+    NAME = 'LogCollector'
+    NAMESPACE = 'collector'
+    REGISTER_URL = 'http://{master_address}/logagg/v1/register_component?namespace={namespace}&cluster_name={cluster_name}&cluster_passwd={cluster_passwd}&host={host}&port={port}'
+    GET_NSQ_URL = 'http://{master_address}/logagg/v1/get_nsq?cluster_name={cluster_name}' 
+
 
     QUEUE_MAX_SIZE = 2000 # Maximum number of messages in in-mem queue
     MAX_NBYTES_TO_SEND = 4.5 * (1024**2) # Number of bytes from in-mem queue minimally required to push
@@ -51,7 +53,6 @@ class LogCollector():
     QUEUE_READ_TIMEOUT = 1 # Wait time when doing blocking read on the in-mem q
     PYGTAIL_ACK_WAIT_TIME = 0.05 # TODO: Document this
     SCAN_FPATTERNS_INTERVAL = 30 # How often to scan filesystem for files matching fpatterns
-    HOST = socket.gethostname()
     HEARTBEAT_RESTART_INTERVAL = 30 # Wait time if heartbeat sending stops
     LOGAGGFS_FPATH_PATTERN = re.compile("[a-fA-F\d]{32}") # MD5 hash pattern
     SERVERSTATS_FPATH = '/var/log/serverstats/serverstats.log' # Path to serverstats log file
@@ -73,7 +74,11 @@ class LogCollector():
     }
 
 
-    def __init__(self, data_dir, logaggfs_dir, master, log=utils.DUMMY):
+    def __init__(self, host, port, master, data_dir, logaggfs_dir, log=utils.DUMMY):
+
+        self.host = host
+        self.port = port
+        self.master = master
 
         # For storing state
         data_path = os.path.abspath(os.path.join(data_dir, 'logagg-data'))
@@ -105,10 +110,24 @@ class LogCollector():
             self._init_fpaths()
 
         # Create nsq_sender
-        self.nsq_sender = self._init_nsq_sender()
+        self.nsq_sender_logs, self.nsq_sender_heartbeat = self._init_nsq_sender()
 
         self._ensure_trackfiles_sync()
 
+
+    def register_to_master(self):
+        '''
+        'http://localhost:1088/logagg/v1/register_component?namespace=master&cluster_name=logagg&passwd=ad9379b4&host=78.47.113.210&port=1088'
+        '''
+        master = self.master
+        url = self.REGISTER_URL.format(master_address=master.host+':'+master.port,
+                namespace=self.NAMESPACE,
+                cluster_name=master.cluster_name,
+                cluster_passwd=master.cluster_passwd,
+                host=self.host,
+                port=self.port)
+
+        return json.loads(requests.get(url).content)
 
     def _init_fpaths(self):
         '''
@@ -128,13 +147,26 @@ class LogCollector():
         if self.master is None:
             self.log.warn('nsq_not_set',
                     msg='will send formatted logs to stdout')
-            nsq_sender = utils.DUMMY
-
+            nsq_sender_logs = utils.DUMMY
+        
         else:
-            # Code to contact master
-            pass
+            url = self.GET_NSQ_URL.format(master_address=self.master.host+':'+self.master.port,
+            cluster_name=self.master.cluster_name)
 
-        return nsq_sender
+            resp = json.loads(requests.get(url).content)
+            nsqd_http_address = resp['result']['nsqd_http_address']
+            heartbeat_topic = resp['result']['heartbeat_topic']
+            logs_topic = resp['result']['log_topic']
+            nsq_depth_limit = resp['result']['nsq_depth_limit']
+
+            nsq_sender_heartbeat = NSQSender(nsqd_http_address,
+                    heartbeat_topic,
+                    self.log)
+            nsq_sender_logs = NSQSender(nsqd_http_address,
+                    logs_topic,
+                    self.log)
+
+        return nsq_sender_logs, nsq_sender_heartbeat 
 
 
     def _init_logaggfs_paths(self, logaggfs_dir):
@@ -305,7 +337,7 @@ class LogCollector():
         return dict(
             id=None,
             file=fpath,
-            host=self.HOST,
+            host=self.host,
             formatter=formatter,
             event='event',
             data={},
@@ -457,12 +489,12 @@ class LogCollector():
                             msgs_nbytes=msgs_nbytes)
 
         try:
-            if isinstance(self.nsq_sender, type(utils.DUMMY)):
+            if isinstance(self.nsq_sender_logs, type(utils.DUMMY)):
                 for m in msgs:
                     self.log.info('final_log_format', log=m['log'])
             else:
                 self.log.debug('trying_to_push_to_nsq', msgs_length=len(msgs))
-                self.nsq_sender.handle_logs(msgs)
+                self.nsq_sender_logs.handle_logs(msgs)
                 self.log.debug('pushed_to_nsq', msgs_length=len(msgs))
             self._confirm_success(msgs)
             msgs = msgs_pending
@@ -564,18 +596,19 @@ class LogCollector():
 
         # Sends continuous heartbeats to a seperate topic in nsq
         if self.log_reader_threads:
-            for f in self.log_reader_threads:
-                files_tracked = self.log_reader_threads.keys()
+            files_tracked = [k for k in  self.log_reader_threads.keys()]
         else:
             files_tracked = ''
 
-        heartbeat_payload = {'host': self.HOST,
+        heartbeat_payload = {'host': self.host,
+                            'port': self.port,
+                            'namespace': self.NAMESPACE,
+                            'cluster_name': self.master.cluster_name,
                             'heartbeat_number': state.heartbeat_number,
                             'timestamp': time.time(),
-                            'nsq_topic': self.nsq_sender.topic_name,
-                            'files_tracked': files_tracked
+                            'files_tracked': files_tracked,
                             }
-        self.nsq_sender.handle_heartbeat(heartbeat_payload)
+        self.nsq_sender_heartbeat.handle_heartbeat(heartbeat_payload)
         state.heartbeat_number += 1
         time.sleep(self.HEARTBEAT_RESTART_INTERVAL)
 
@@ -646,6 +679,7 @@ class CollectorService():
     def __init__(self, collector, log):
         self.collector = collector
         self.log = log
+        self.collector.collect()
 
 
     def start(self) -> dict:
@@ -682,8 +716,8 @@ class CollectorService():
         Returns NSQ details
         '''
 
-        return dict(nsqd_http_address = self.collector.nsq_sender.nsqd_http_address,
-                topic_name = self.collector.nsq_sender.topic_name)
+        return dict(nsqd_http_address = self.collector.nsq_sender_logs.nsqd_http_address,
+                topic_name = self.collector.nsq_sender_logs.topic_name)
 
 
     def set_nsq(self, nsqd_http_address:str, topic_name:str) -> dict:
@@ -691,8 +725,8 @@ class CollectorService():
         Takes details of NSQ to which formatted logs are to be sent
         '''
 
-        nsq_sender = NSQSender(nsqd_http_address, topic_name, self.log)
-        self.collector.nsq_sender = nsq_sender
+        nsq_sender_logs = NSQSender(nsqd_http_address, topic_name, self.log)
+        self.collector.nsq_sender_logs = nsq_sender_logs
 
         return self._get_nsq()
 

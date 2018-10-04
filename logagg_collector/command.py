@@ -1,4 +1,5 @@
 import os
+import socket
 
 from basescript import BaseScript
 from deeputil import AttrDict
@@ -6,9 +7,9 @@ import tornado.ioloop
 import tornado.web
 from kwikapi.tornado import RequestHandler
 from kwikapi import API
+from logagg_utils import InvalidArgument
 
 from .collector import LogCollector, CollectorService
-from .exceptions import InvalidArgument
 
 class LogaggCollectorCommand(BaseScript):
     DESC = 'Logagg command line tool'
@@ -23,8 +24,8 @@ class LogaggCollectorCommand(BaseScript):
                     a = a.split('=')
                     if a[0] == 'host': master.host = a[-1]
                     elif a[0] == 'port': master.port = a[-1]
-                    elif a[0] == 'key': master.key = a[-1]
-                    elif a[0] == 'secret': master.secret = a[-1]
+                    elif a[0] == 'cluster_name': master.cluster_name = a[-1]
+                    elif a[0] == 'cluster_passwd': master.cluster_passwd = a[-1]
                     else: raise ValueError
 
             except ValueError:
@@ -35,14 +36,26 @@ class LogaggCollectorCommand(BaseScript):
 
         # Create collector object
         collector = LogCollector(
+            self.args.host,
+            self.args.port,
+            master,
             self.args.data_dir,
             self.args.logaggfs_dir,
-            master,
             self.log)
 
-        collector_api = CollectorService(collector, self.log)
-        api = API()
-        api.register(collector_api, 'v1')
+        register_response = collector.register_to_master()
+
+        if register_response['result']['authentication'] == 'passed':
+            collector_api = CollectorService(collector, self.log)
+            api = API()
+            api.register(collector_api, 'v1')
+            try:
+                tornado.ioloop.IOLoop.current().start()
+            except tornado.ioloop.IOLoop.current().start():
+                self.log.info('exiting')
+
+        else:
+            raise AuthenticationFailure(register_response)
 
         app = tornado.web.Application([
             (r'^/collector/.*', RequestHandler, dict(api=api)),
@@ -59,11 +72,14 @@ class LogaggCollectorCommand(BaseScript):
 
         collect_cmd.set_defaults(func=self.collect)
         collect_cmd.add_argument(
+                '--host', '-i', default=socket.gethostname(),
+                help='Hostname of this service for other components to contact to, default: %(default)s')
+        collect_cmd.add_argument(
                 '--port', '-p', default=1099,
                 help='port to run logagg collector service on, default: %(default)s')
         collect_cmd.add_argument(
                 '--master', '-m',
-                help= 'Master service details, format: <host=localhost:port=1100:key=xyz:secret=xxxx>')
+                help= 'Master service details, format: host=<hostname>:port=<port>:cluster_name=<name>:cluster_passwd=<cluster_passwd>')
         collect_cmd.add_argument(
                 '--no-master', action='store_true',
                 help= 'If collector is to run independently, witout a master service')
