@@ -42,8 +42,7 @@ class LogCollector():
     NAME = 'LogCollector'
     NAMESPACE = 'collector'
     REGISTER_URL = 'http://{master_address}/logagg/v1/register_component?namespace={namespace}&cluster_name={cluster_name}&cluster_passwd={cluster_passwd}&host={host}&port={port}'
-    GET_NSQ_URL = 'http://{master_address}/logagg/v1/get_nsq?cluster_name={cluster_name}' 
-
+    GET_CLUSTER_INFO_URL = 'http://{host}:{port}/logagg/v1/get_cluster_info?cluster_name={cluster_name}&cluster_passwd={cluster_passwd}'
 
     QUEUE_MAX_SIZE = 2000 # Maximum number of messages in in-mem queue
     MAX_NBYTES_TO_SEND = 4.5 * (1024**2) # Number of bytes from in-mem queue minimally required to push
@@ -84,10 +83,6 @@ class LogCollector():
         data_path = os.path.abspath(os.path.join(data_dir, 'logagg-data'))
         self.data_path = utils.ensure_dir(data_path)
 
-        # For log file that have been read
-        archive_path = os.path.abspath(os.path.join(data_dir, 'logagg-archive'))
-        self.archive_dir = utils.ensure_dir(archive_path)
-
         self.master = master
 
         self.log = log
@@ -127,7 +122,13 @@ class LogCollector():
                 host=self.host,
                 port=self.port)
 
-        return json.loads(requests.get(url).content)
+        try:
+            register = requests.get(url)
+            register_result = json.loads(register.content.decode('utf-8'))
+            return register_result
+        except requests.exceptions.ConnectionError:
+            err_msg = 'Could not reach master, url: {}'.format(url)
+            raise Exception(err_msg)
 
     def _init_fpaths(self):
         '''
@@ -150,23 +151,35 @@ class LogCollector():
             nsq_sender_logs = utils.DUMMY
         
         else:
-            url = self.GET_NSQ_URL.format(master_address=self.master.host+':'+self.master.port,
-            cluster_name=self.master.cluster_name)
+            url = self.GET_CLUSTER_INFO_URL.format(host=self.master.host,
+                                                    port=self.master.port,
+                                                    cluster_name=self.master.cluster_name,
+                                                    cluster_passwd=self.master.cluster_passwd)
+            try:
+                get_cluster_info = requests.get(url)
+                get_cluster_info_result = json.loads(get_cluster_info.content.decode('utf-8'))
+                if get_cluster_info_result['result']['success']:
+                    nsqd_http_address = get_cluster_info_result['result']['cluster_info']['nsqd_http_address']
+                    heartbeat_topic = get_cluster_info_result['result']['cluster_info']['heartbeat_topic']
+                    logs_topic = get_cluster_info_result['result']['cluster_info']['logs_topic']
+                    nsq_depth_limit = get_cluster_info_result['result']['cluster_info']['nsq_depth_limit']
 
-            resp = json.loads(requests.get(url).content)
-            nsqd_http_address = resp['result']['nsqd_http_address']
-            heartbeat_topic = resp['result']['heartbeat_topic']
-            logs_topic = resp['result']['log_topic']
-            nsq_depth_limit = resp['result']['nsq_depth_limit']
+                    nsq_sender_heartbeat = NSQSender(nsqd_http_address,
+                                                        heartbeat_topic,
+                                                        self.log)
+                    nsq_sender_logs = NSQSender(nsqd_http_address,
+                                                logs_topic,
+                                                self.log)
 
-            nsq_sender_heartbeat = NSQSender(nsqd_http_address,
-                    heartbeat_topic,
-                    self.log)
-            nsq_sender_logs = NSQSender(nsqd_http_address,
-                    logs_topic,
-                    self.log)
+                    return nsq_sender_logs, nsq_sender_heartbeat
 
-        return nsq_sender_logs, nsq_sender_heartbeat 
+                else:
+                    err_msg = get_cluster_info_result['result']['details']
+                    raise Exception(err_msg)
+
+            except requests.exceptions.ConnectionError:
+                err_msg = 'Could not reach master, url: {}'.format(url)
+                raise Exception(err_msg)
 
 
     def _init_logaggfs_paths(self, logaggfs_dir):
@@ -350,12 +363,12 @@ class LogCollector():
           )
 
 
-    def _archive_file(self, fpath):
+    def _delete_file(self, fpath):
         '''
         Move log file from logaggfs 'logs' directory
         '''
-        shutil.move(fpath, self.archive_dir+'/'+fpath.split('/')[-1])
         os.remove(fpath+'.offset')
+        os.remove(fpath)
 
 
     @keeprunning(LOG_FILE_POLL_INTERVAL, on_error=utils.log_exception)
@@ -374,8 +387,8 @@ class LogCollector():
             # If last file in the list keep polling until next file arrives
             self._collect_log_lines(log_files)
             if not f == fpaths[-1]:
-                self.log.debug('archiving_file', f=f)
-                self._archive_file(f)
+                self.log.debug('deleting_file', f=f)
+                self._delete_file(f)
         time.sleep(1)
 
 
@@ -600,13 +613,13 @@ class LogCollector():
         else:
             files_tracked = ''
 
-        heartbeat_payload = {'host': self.host,
+        heartbeat_payload = {'namespace': self.NAMESPACE,
+                            'host': self.host,
                             'port': self.port,
-                            'namespace': self.NAMESPACE,
                             'cluster_name': self.master.cluster_name,
+                            'files_tracked': files_tracked,
                             'heartbeat_number': state.heartbeat_number,
                             'timestamp': time.time(),
-                            'files_tracked': files_tracked,
                             }
         self.nsq_sender_heartbeat.handle_heartbeat(heartbeat_payload)
         state.heartbeat_number += 1
@@ -653,13 +666,13 @@ class LogCollector():
             # Write previous files and add the new file
             if not self._fpath_in_trackfiles(new):
                 with open(tmpfile, 'w') as t: t.write((old+new+'\n'))
-
-        shutil.move(tmpfile, self.logaggfs.trackfiles)
+                shutil.move(tmpfile, self.logaggfs.trackfiles)
 
 
     def remove_from_logaggfs_trackfile(self, fpath):
-
-        # Given a fpath remove it from logaggfs trackfiles.txt via moving
+        '''
+        Given a fpath remove it from logaggfs trackfiles.txt via moving
+        '''
         fd, tmpfile = tempfile.mkstemp()
 
         with open(self.logaggfs.trackfiles, 'r') as f:
@@ -683,22 +696,35 @@ class CollectorService():
 
 
     def start(self) -> dict:
+        '''
+        Sample url: 'http://localhost:6600/collector/v1/start'
+        '''
         self.collector.collect()
 
         return dict(self.collector.state)
 
+    def stop(self) -> dict:
+        '''
+        Sample url: 'http://localhost:6600/collector/v1/stop'
+        '''
+        sys.exit(0)
+
 
     def add_file(self, fpath:str, formatter:str) -> list:
-
+        '''
+        Sample url: 'http://localhost:6600/collector/v1/add_file?fpath="/var/log/serverstats.log"&formatter="logagg_collector.formatters.docker_file_log_driver"'
+        '''
         f = {"fpath":fpath, "formatter":formatter}
 
         # Add new file to logaggfs trackfiles.txt
         self.collector.add_to_logaggfs_trackfile(f['fpath'])
 
         # Add new file to state
-        s = self.collector.state['fpaths']
-        s.append(f)
-        self.collector.state['fpaths'] = self.collector.fpaths = s
+        state = self.collector.state['fpaths']
+        # If fpath already present; remove and update
+        if f in state: state.remove(f)
+        state.append(f)
+        self.collector.state['fpaths'] = self.collector.fpaths = state
         self.collector.state.flush()
 
         return self.collector.state['fpaths']
@@ -715,7 +741,6 @@ class CollectorService():
         '''
         Returns NSQ details
         '''
-
         return dict(nsqd_http_address = self.collector.nsq_sender_logs.nsqd_http_address,
                 topic_name = self.collector.nsq_sender_logs.topic_name)
 
@@ -724,7 +749,6 @@ class CollectorService():
         '''
         Takes details of NSQ to which formatted logs are to be sent
         '''
-
         nsq_sender_logs = NSQSender(nsqd_http_address, topic_name, self.log)
         self.collector.nsq_sender_logs = nsq_sender_logs
 
@@ -735,7 +759,6 @@ class CollectorService():
         '''
         Returns NSQ details
         '''
-
         return self._get_nsq()
 
 
@@ -748,6 +771,9 @@ class CollectorService():
 
 
     def remove_file(self, fpath:str) -> dict:
+        '''
+        Sample url: 'http://localhost:6600/collector/v1/add_file?fpath="/var/log/serverstats.log"'
+        '''
         #FIXME: stops the program after removing
 
         # Remove fpath from logaggfs trackfile.txt
@@ -763,5 +789,6 @@ class CollectorService():
         self.collector.state.flush()
         self.log.info('exiting', fpaths=self.collector.state['fpaths'])
         self.log.info('restart_for_changes_to_take_effect')
+        return self.collector.state['fpaths']
         sys.exit(0)
 

@@ -7,7 +7,7 @@ import tornado.ioloop
 import tornado.web
 from kwikapi.tornado import RequestHandler
 from kwikapi import API
-from logagg_utils import InvalidArgument
+from logagg_utils import InvalidArgument, start_daemon_thread
 
 from .collector import LogCollector, CollectorService
 
@@ -45,24 +45,23 @@ class LogaggCollectorCommand(BaseScript):
 
         register_response = collector.register_to_master()
 
-        if register_response['result']['authentication'] == 'passed':
+        if register_response['result']['success']:
             collector_api = CollectorService(collector, self.log)
             api = API()
             api.register(collector_api, 'v1')
             try:
+                app = tornado.web.Application([
+                    (r'^/collector/.*', RequestHandler, dict(api=api)),
+                    ])
+                app.listen(self.args.port)
                 tornado.ioloop.IOLoop.current().start()
-            except tornado.ioloop.IOLoop.current().start():
+            except:
                 self.log.info('exiting')
 
         else:
-            raise AuthenticationFailure(register_response)
+            err_msg = register_response['result']['details']
+            raise Exception(err_msg)
 
-        app = tornado.web.Application([
-            (r'^/collector/.*', RequestHandler, dict(api=api)),
-                ])
-
-        app.listen(self.args.port)
-        tornado.ioloop.IOLoop.current().start()
 
     def define_subcommands(self, subcommands):
         super(LogaggCollectorCommand, self).define_subcommands(subcommands)
@@ -76,7 +75,7 @@ class LogaggCollectorCommand(BaseScript):
                 help='Hostname of this service for other components to contact to, default: %(default)s')
         collect_cmd.add_argument(
                 '--port', '-p', default=1099,
-                help='port to run logagg collector service on, default: %(default)s')
+                help='Port to run logagg collector service on, default: %(default)s')
         collect_cmd.add_argument(
                 '--master', '-m',
                 help= 'Master service details, format: host=<hostname>:port=<port>:cluster_name=<name>:cluster_passwd=<cluster_passwd>')
