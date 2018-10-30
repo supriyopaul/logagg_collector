@@ -15,7 +15,7 @@ setup(
         "https://github.com/deep-compute/logagg/logagg_collector",
     ],
     install_requires=[
-	"kwikapi[tornado]==0.2.7",
+	"kwikapi[tornado]==0.3.2",
 	"basescript==0.2.6",
         "diskdict==0.2.2",
         "ujson==1.35",
