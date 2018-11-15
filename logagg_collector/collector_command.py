@@ -7,14 +7,18 @@ import tornado.ioloop
 import tornado.web
 from kwikapi.tornado import RequestHandler
 from kwikapi import API
-from logagg_utils import InvalidArgument, start_daemon_thread
+from logagg_utils import start_daemon_thread
 
 from .collector import LogCollector, CollectorService
 
 class LogaggCollectorCommand(BaseScript):
     DESC = 'Logagg command line tool'
 
-    def collect(self):
+    def parse_master_args(self, master_arg):
+        '''
+        Parse master arguments
+        '''
+        # Collector running with or without master
         if not self.args.no_master:
             master = AttrDict()
             try:
@@ -29,22 +33,28 @@ class LogaggCollectorCommand(BaseScript):
                     else: raise ValueError
 
             except ValueError:
-                raise InvalidArgument(self.args.master)
+                raise Exception('Invalid argument arg: {}'.format(self.args.master))
+            return master
 
         else:
-            master = None
+            return None
 
+    def collect(self):
+        '''
+        Start collector service after parsing arguments
+        '''
+        master = self.parse_master_args(self.args.master)
         # Create collector object
-        collector = LogCollector(
-            self.args.host,
-            self.args.port,
-            master,
-            self.args.data_dir,
-            self.args.logaggfs_dir,
-            self.log)
-
+        collector = LogCollector(self.args.host,
+                                    self.args.port,
+                                    master,
+                                    self.args.data_dir,
+                                    self.args.logaggfs_dir,
+                                    self.log)
+        # Request authentication master details 
         register_response = collector.register_to_master()
 
+        # Start server
         if register_response['result']['success']:
             collector_api = CollectorService(collector, self.log)
             api = API()
@@ -57,13 +67,15 @@ class LogaggCollectorCommand(BaseScript):
                 tornado.ioloop.IOLoop.current().start()
             except:
                 self.log.info('exiting')
-
         else:
             err_msg = register_response['result']['details']
             raise Exception(err_msg)
 
 
     def define_subcommands(self, subcommands):
+        '''
+        Subcommands for the CLI
+        '''
         super(LogaggCollectorCommand, self).define_subcommands(subcommands)
 
         collect_cmd = subcommands.add_parser('runserver',
@@ -88,6 +100,7 @@ class LogaggCollectorCommand(BaseScript):
         collect_cmd.add_argument(
                 '--logaggfs-dir', '-l', default='/logcache',
                 help= 'LogaggFS directory, default: %(default)s')
+
 
 def main():
     LogaggCollectorCommand().start()

@@ -18,7 +18,7 @@ import tempfile
 import requests
 import ujson as json
 from diskdict import DiskDict
-from deeputil import AttrDict
+from deeputil import AttrDict, load_object
 from deeputil import keeprunning
 from pygtail import Pygtail
 from logagg_utils import utils
@@ -31,7 +31,7 @@ def load_formatter_fn(formatter):
     >>> load_formatter_fn('logagg_collector.formatters.basescript') #doctest: +ELLIPSIS
     <function basescript at 0x...>
     '''
-    obj = utils.load_object(formatter)
+    obj = load_object(formatter)
     if not hasattr(obj, 'ispartial'):
         obj.ispartial = utils.ispartial
     return obj
@@ -39,7 +39,6 @@ def load_formatter_fn(formatter):
 
 class LogCollector():
     DESC = 'Collects the log information and sends to NSQTopic'
-    NAME = 'LogCollector'
     NAMESPACE = 'collector'
     REGISTER_URL = 'http://{master_address}/logagg/v1/register_component?namespace={namespace}&cluster_name={cluster_name}&cluster_passwd={cluster_passwd}&host={host}&port={port}'
     GET_CLUSTER_INFO_URL = 'http://{host}:{port}/logagg/v1/get_cluster_info?cluster_name={cluster_name}&cluster_passwd={cluster_passwd}'
@@ -112,8 +111,12 @@ class LogCollector():
 
     def register_to_master(self):
         '''
-        'http://localhost:1088/logagg/v1/register_component?namespace=master&cluster_name=logagg&passwd=ad9379b4&host=78.47.113.210&port=1088'
+        Request authentication with master details
+        
+        Sample url: http://localhost:1088/logagg/v1/register_component?namespace=master
+                    &cluster_name=logagg&passwd=ad9379b4&host=localhost&port=1088
         '''
+        #TODO: test case
         master = self.master
         url = self.REGISTER_URL.format(master_address=master.host+':'+master.port,
                 namespace=self.NAMESPACE,
@@ -133,6 +136,17 @@ class LogCollector():
     def _init_fpaths(self):
         '''
         Files to be collected by default
+
+        >>> import tempfile
+        >>> temp_dir = tempfile.TemporaryDirectory()
+        >>> temp_dir_path = temp_dir.name
+        >>> trackfile = open(temp_dir_path+'/trackfiles.txt', 'w+'); trackfile.close()
+        >>> lc = collector = LogCollector('localhost', '1088', None, temp_dir_path, temp_dir_path)
+
+        >>> lc._init_fpaths()
+        [{'fpath': '/var/log/serverstats/serverstats.log', 'formatter': 'logagg_collector.formatters.docker_file_log_driver'}]
+
+        >>> temp_dir.cleanup()
         '''
         self.state['fpaths'] = [{'fpath':self.SERVERSTATS_FPATH,
             'formatter':self.DOCKER_FORMATTER}]
@@ -143,13 +157,25 @@ class LogCollector():
     def _init_nsq_sender(self):
         '''
         Initialize nsq_sender on startup
+        >>> import tempfile
+        >>> temp_dir = tempfile.TemporaryDirectory()
+        >>> temp_dir_path = temp_dir.name
+        >>> trackfile = open(temp_dir_path+'/trackfiles.txt', 'w+'); trackfile.close()
+        >>> lc = collector = LogCollector('localhost', '1088', None, temp_dir_path, temp_dir_path)
+
+        >>> lc._init_nsq_sender() # doctest: +ELLIPSIS
+        (<deeputil.misc.Dummy object at ...>, <deeputil.misc.Dummy object at ...>)
+
+        >>> temp_dir.cleanup()
         '''
-        #FIXME: Take this from master
+        #TODO: test cases for master mode
+
+        # Check if running on master mode or not
         if self.master is None:
-            self.log.warn('nsq_not_set',
-                    msg='will send formatted logs to stdout')
-            nsq_sender_logs = utils.DUMMY
-        
+            self.log.warn('nsq_not_set', msg='will send formatted logs to stdout')
+            return utils.DUMMY, utils.DUMMY
+
+        # Prepare to request NSQ details from master
         else:
             url = self.GET_CLUSTER_INFO_URL.format(host=self.master.host,
                                                     port=self.master.port,
@@ -158,33 +184,43 @@ class LogCollector():
             try:
                 get_cluster_info = requests.get(url)
                 get_cluster_info_result = json.loads(get_cluster_info.content.decode('utf-8'))
-                if get_cluster_info_result['result']['success']:
-                    nsqd_http_address = get_cluster_info_result['result']['cluster_info']['nsqd_http_address']
-                    heartbeat_topic = get_cluster_info_result['result']['cluster_info']['heartbeat_topic']
-                    logs_topic = get_cluster_info_result['result']['cluster_info']['logs_topic']
-                    nsq_depth_limit = get_cluster_info_result['result']['cluster_info']['nsq_depth_limit']
-
-                    nsq_sender_heartbeat = NSQSender(nsqd_http_address,
-                                                        heartbeat_topic,
-                                                        self.log)
-                    nsq_sender_logs = NSQSender(nsqd_http_address,
-                                                logs_topic,
-                                                self.log)
-
-                    return nsq_sender_logs, nsq_sender_heartbeat
-
-                else:
-                    err_msg = get_cluster_info_result['result']['details']
-                    raise Exception(err_msg)
 
             except requests.exceptions.ConnectionError:
                 err_msg = 'Could not reach master, url: {}'.format(url)
+                raise Exception(err_msg)
+
+            if get_cluster_info_result['result'].get('success'):
+                nsqd_http_address = get_cluster_info_result['result']['cluster_info']['nsqd_http_address']
+                heartbeat_topic = get_cluster_info_result['result']['cluster_info']['heartbeat_topic']
+                logs_topic = get_cluster_info_result['result']['cluster_info']['logs_topic']
+                nsq_depth_limit = get_cluster_info_result['result']['cluster_info']['nsq_depth_limit']
+                
+                # Create NSQSender object for sending logs and heartbeats
+                nsq_sender_heartbeat = NSQSender(nsqd_http_address,
+                                                    heartbeat_topic,
+                                                    self.log)
+                nsq_sender_logs = NSQSender(nsqd_http_address,
+                                                logs_topic,
+                                                self.log)
+                return nsq_sender_logs, nsq_sender_heartbeat
+
+            else:
+                err_msg = get_cluster_info_result['result'].get('details')
                 raise Exception(err_msg)
 
 
     def _init_logaggfs_paths(self, logaggfs_dir):
         '''
         Logaggfs directories and file initialization
+
+        >>> test_dir = utils.ensure_dir('/tmp/xyz')
+        >>> trackfile = open(test_dir+'/trackfiles.txt', 'w+'); trackfile.close()
+        >>> lc = collector = LogCollector('localhost', '1088', None, test_dir, test_dir)
+
+        >>> lc._init_logaggfs_paths(test_dir)
+        AttrDict({'logcache': '/tmp/xyz', 'logs_dir': '/tmp/xyz/logs', 'trackfiles': '/tmp/xyz/trackfiles.txt'})
+
+        >>> import shutil; shutil.rmtree(test_dir)
         '''
         logaggfs = AttrDict()
         logaggfs.logcache = logaggfs_dir
@@ -195,8 +231,22 @@ class LogCollector():
 
     def _ensure_trackfiles_sync(self):
         '''
-        Make sure fpaths in logagg state-file are present in
-        logaggfs trackfiles on start up
+        Make sure fpaths in logagg state-file are present in logaggfs trackfiles on start up
+
+        >>> import tempfile
+        >>> temp_dir = tempfile.TemporaryDirectory()
+        >>> temp_dir_path = temp_dir.name
+        >>> trackfile = open(temp_dir_path+'/trackfiles.txt', 'w+'); trackfile.close()
+        >>> lc = collector = LogCollector('localhost', '1088', None, temp_dir_path, temp_dir_path)
+
+        >>> with open(lc.logaggfs.trackfiles) as f: f.read()
+        '/var/log/serverstats/serverstats.log\\n'
+        >>> lc.state['fpaths'] = [{'fpath': '/var/log/some.log'}]; lc.state.flush()
+        >>> lc._ensure_trackfiles_sync()
+        >>> with open(lc.logaggfs.trackfiles) as f: f.read()
+        '/var/log/serverstats/serverstats.log\\n/var/log/some.log\\n'
+
+        >>> temp_dir.cleanup()
         '''
         # If all the files are present in trackfiles
         for f in self.state['fpaths']:
@@ -205,14 +255,21 @@ class LogCollector():
 
     def _remove_redundancy(self, log):
         '''
-        Removes duplicate data from 'data' inside log dict and brings it out
+        Removes duplicate data from 'data' inside log dictionary and brings it out
 
-        >>> lc = LogCollector('file=/path/to/log_file.log:formatter=logagg.formatters.basescript', 30)
+        >>> import tempfile
+        >>> temp_dir = tempfile.TemporaryDirectory()
+        >>> temp_dir_path = temp_dir.name
+        >>> trackfile = open(temp_dir_path+'/trackfiles.txt', 'w+'); trackfile.close()
+        >>> lc = collector = LogCollector('localhost', '1088', None, temp_dir_path, temp_dir_path)
 
         >>> log = {'id' : 46846876, 'type' : 'log',
         ...         'data' : {'a' : 1, 'b' : 2, 'type' : 'metric'}}
-        >>> lc._remove_redundancy(log)
-        {'data': {'a': 1, 'b': 2}, 'type': 'metric', 'id': 46846876}
+        >>> from pprint import pprint
+        >>> pprint(lc._remove_redundancy(log))
+        {'data': {'a': 1, 'b': 2}, 'id': 46846876, 'type': 'metric'}
+
+        >>> temp_dir.cleanup()
         '''
         for key in log:
             if key in log and key in log['data']:
@@ -224,7 +281,11 @@ class LogCollector():
         '''
         Assert if the formatted log is of the same structure as specified
 
-        >>> lc = LogCollector('file=/path/to/file.log:formatter=logagg.formatters.basescript', 30)
+        >>> import tempfile
+        >>> temp_dir = tempfile.TemporaryDirectory()
+        >>> temp_dir_path = temp_dir.name
+        >>> trackfile = open(temp_dir_path+'/trackfiles.txt', 'w+'); trackfile.close()
+        >>> lc = collector = LogCollector('localhost', '1088', None, temp_dir_path, temp_dir_path)
 
         >>> incomplete_log = {'data' : {'x' : 1, 'y' : 2},
         ...                     'raw' : 'Not all keys present'}
@@ -261,6 +322,8 @@ class LogCollector():
         ...  'type': 'log'}
         >>> lc._validate_log_format(correct_log)
         'passed'
+
+        >>> temp_dir.cleanup()
         '''
 
         keys_in_log = set(log)
@@ -305,6 +368,33 @@ class LogCollector():
     def _iter_logs(self, freader, fmtfn):
         '''
         Iterate on log lines and identify full lines from full ones
+        >>> import tempfile
+        >>> temp_dir = tempfile.TemporaryDirectory()
+        >>> temp_dir_path = temp_dir.name
+        >>> trackfile = open(temp_dir_path+'/trackfiles.txt', 'w+'); trackfile.close()
+        >>> lc = collector = LogCollector('localhost', '1088', None, temp_dir_path, temp_dir_path)
+
+        >>> def fmtfn(line):
+        ...     return line
+        >>> def ispartial(line):
+        ...     if line.startswith('--->'): return True
+        ...     else: return False
+        >>> fmtfn.ispartial = ispartial
+        >>> log_dir = tempfile.TemporaryDirectory()
+
+        >>> log_dir_path = log_dir.name
+        >>> log_file_path = log_dir_path + '/log_file.log'
+        >>> loglines = 'Traceback (most recent call last):\\n--->File "<stdin>", line 1, in <module>\\n--->NameError: name "spam" is not defined'
+        >>> with open(log_file_path, 'w+') as logfile: w = logfile.write(loglines)
+        >>> sample_freader = Pygtail(log_file_path)
+
+        >>> for log in lc._iter_logs(sample_freader, fmtfn): print(log[0])
+	Traceback (most recent call last):
+        --->File "<stdin>", line 1, in <module>
+        --->NameError: name "spam" is not define
+
+        >>> temp_dir.cleanup()
+        >>> log_dir.cleanup()
         '''
         # FIXME: does not handle partial lines at the start of a file properly
 
@@ -325,7 +415,12 @@ class LogCollector():
 
     def _assign_default_log_values(self, fpath, line, formatter):
         '''
-        >>> lc = LogCollector('file=/path/to/log_file.log:formatter=logagg.formatters.basescript', 30)
+        Fills up default data into one log record
+        >>> import tempfile
+        >>> temp_dir = tempfile.TemporaryDirectory()
+        >>> temp_dir_path = temp_dir.name
+        >>> trackfile = open(temp_dir_path+'/trackfiles.txt', 'w+'); trackfile.close()
+        >>> lc = collector = LogCollector('localhost', '1088', None, temp_dir_path, temp_dir_path)
         >>> from pprint import pprint
 
         >>> formatter = 'logagg.formatters.mongodb'
@@ -346,6 +441,8 @@ class LogCollector():
          'raw': 'some log line here',
          'timestamp': '...',
          'type': 'log'}
+
+        >>> temp_dir.cleanup()
         '''
         return dict(
             id=None,
@@ -366,9 +463,33 @@ class LogCollector():
     def _delete_file(self, fpath):
         '''
         Move log file from logaggfs 'logs' directory
+        >>> import tempfile
+        >>> temp_dir = tempfile.TemporaryDirectory()
+        >>> temp_dir_path = temp_dir.name
+        >>> trackfile = open(temp_dir_path+'/trackfiles.txt', 'w+'); trackfile.close()
+        >>> lc = collector = LogCollector('localhost', '1088', None, temp_dir_path, temp_dir_path)
+
+        >>> log_file_dir = tempfile.TemporaryDirectory()
+        >>> log_file_path = log_file_dir.name + '/log_file.log'
+        >>> offset_file_path = log_file_path + '.offset'
+        >>> log_file = open(log_file_path, 'w+'); trackfile.close()
+        >>> offset_file = open(offset_file_path, 'w+'); offset_file.close() 
+        >>> import os
+        >>> os.path.isfile(log_file_path)
+        True
+        >>> os.path.isfile(offset_file_path)
+        True
+        >>> lc._delete_file(log_file_path)
+        >>> os.path.isfile(log_file_path)
+        False
+        >>> os.path.isfile(offset_file_path)
+        False
+
+        >>> temp_dir.cleanup()
+        >>> log_file_dir.cleanup()
         '''
-        os.remove(fpath+'.offset')
         os.remove(fpath)
+        os.remove(fpath+'.offset')
 
 
     @keeprunning(LOG_FILE_POLL_INTERVAL, on_error=utils.log_exception)
@@ -531,11 +652,11 @@ class LogCollector():
             freader.update_offset_file(msg['line_info'])
 
 
-    def _compute_md5_fpatterns(self, f):
+    def _compute_md5_fpatterns(self, fpath):
         '''
         For a filepath in logaggfs logs directory compute 'md5*.log' pattern
         '''
-        fpath = f.encode("utf-8")
+        fpath = fpath.encode("utf-8")
         d = self.logaggfs.logs_dir
         dir_contents = [f for f in os.listdir(d) if bool(self.LOGAGGFS_FPATH_PATTERN.match(f)) and isfile(join(d, f))]
         dir_contents = set(dir_contents)
@@ -648,7 +769,8 @@ class LogCollector():
         '''
 
         # List of files in trackfiles.txt
-        tf = open(self.logaggfs.trackfiles, 'r').readlines()
+        with open(self.logaggfs.trackfiles, 'r') as f:
+            tf = f.readlines()
 
         for path in tf:
             if path[:-1] == fpath: return True

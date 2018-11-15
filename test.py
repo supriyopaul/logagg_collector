@@ -3,8 +3,8 @@
 import doctest
 import unittest
 
-from logagg import formatters
-from logagg import collector
+from logagg_collector import formatters
+from logagg_collector import collector
 
 def suite_maker():
     suite= unittest.TestSuite()
